@@ -144,9 +144,10 @@ public class GCMReceiver extends BroadcastReceiver {
         final String colorName = inboundIntent.getStringExtra("mp_color");
         final String campaignId = inboundIntent.getStringExtra("mp_campaign_id");
         final String messageId = inboundIntent.getStringExtra("mp_message_id");
+        final String extraLogData = inboundIntent.getStringExtra("mp");
         int color = NotificationData.NOT_SET;
 
-        trackCampaignReceived(campaignId, messageId);
+        trackCampaignReceived(campaignId, messageId, extraLogData);
 
         if (colorName != null) {
             try {
@@ -202,12 +203,12 @@ public class GCMReceiver extends BroadcastReceiver {
             notificationTitle = "A message for you";
         }
 
-        final Intent notificationIntent = buildNotificationIntent(context, uriString, campaignId, messageId);
+        final Intent notificationIntent = buildNotificationIntent(context, uriString, campaignId, messageId, extraLogData);
 
         return new NotificationData(notificationIcon, largeNotificationIcon, whiteNotificationIcon, notificationTitle, message, notificationIntent, color);
     }
 
-    private Intent buildNotificationIntent(Context context, String uriString, String campaignId, String messageId) {
+    private Intent buildNotificationIntent(Context context, String uriString, String campaignId, String messageId, String extraLogData) {
         Uri uri = null;
         if (null != uriString) {
             uri = Uri.parse(uriString);
@@ -226,6 +227,10 @@ public class GCMReceiver extends BroadcastReceiver {
 
         if (messageId != null) {
             ret.putExtra("mp_message_id", messageId);
+        }
+
+        if (extraLogData != null) {
+            ret.putExtra("mp", extraLogData);
         }
 
         return ret;
@@ -308,7 +313,8 @@ public class GCMReceiver extends BroadcastReceiver {
                 setWhen(System.currentTimeMillis()).
                 setContentTitle(notificationData.title).
                 setContentText(notificationData.message).
-                setContentIntent(intent);
+                setContentIntent(intent).
+                setDefaults(MPConfig.getInstance(context).getNotificationDefaults());
 
         if (notificationData.largeIcon != NotificationData.NOT_SET) {
             builder.setLargeIcon(BitmapFactory.decodeResource(context.getResources(), notificationData.largeIcon));
@@ -328,7 +334,8 @@ public class GCMReceiver extends BroadcastReceiver {
                 setWhen(System.currentTimeMillis()).
                 setContentTitle(notificationData.title).
                 setContentText(notificationData.message).
-                setContentIntent(intent);
+                setContentIntent(intent).
+                setDefaults(MPConfig.getInstance(context).getNotificationDefaults());
 
         if (notificationData.largeIcon != NotificationData.NOT_SET) {
             builder.setLargeIcon(BitmapFactory.decodeResource(context.getResources(), notificationData.largeIcon));
@@ -349,7 +356,8 @@ public class GCMReceiver extends BroadcastReceiver {
                 setContentTitle(notificationData.title).
                 setContentText(notificationData.message).
                 setContentIntent(intent).
-                setStyle(new Notification.BigTextStyle().bigText(notificationData.message));
+                setStyle(new Notification.BigTextStyle().bigText(notificationData.message)).
+                setDefaults(MPConfig.getInstance(context).getNotificationDefaults());
 
         if (notificationData.largeIcon != NotificationData.NOT_SET) {
             builder.setLargeIcon(BitmapFactory.decodeResource(context.getResources(), notificationData.largeIcon));
@@ -369,7 +377,8 @@ public class GCMReceiver extends BroadcastReceiver {
                 setContentTitle(notificationData.title).
                 setContentText(notificationData.message).
                 setContentIntent(intent).
-                setStyle(new Notification.BigTextStyle().bigText(notificationData.message));
+                setStyle(new Notification.BigTextStyle().bigText(notificationData.message)).
+                setDefaults(MPConfig.getInstance(context).getNotificationDefaults());
 
         if (notificationData.whiteIcon != NotificationData.NOT_SET) {
             builder.setSmallIcon(notificationData.whiteIcon);
@@ -390,7 +399,7 @@ public class GCMReceiver extends BroadcastReceiver {
         return n;
     }
 
-    private void trackCampaignReceived(final String campaignId, final String messageId) {
+    private void trackCampaignReceived(final String campaignId, final String messageId, final String extraLogData) {
         if (campaignId != null && messageId != null) {
             MixpanelAPI.allInstances(new InstanceProcessor() {
                 @Override
@@ -398,8 +407,14 @@ public class GCMReceiver extends BroadcastReceiver {
                     if(api.isAppInForeground()) {
                         JSONObject pushProps = new JSONObject();
                         try {
-                            pushProps.put("campaign_id", campaignId);
-                            pushProps.put("message_id", messageId);
+                            if (extraLogData != null) {
+                                pushProps = new JSONObject(extraLogData);
+                            }
+                        } catch (JSONException e) {}
+
+                        try {
+                            pushProps.put("campaign_id", Integer.valueOf(campaignId).intValue());
+                            pushProps.put("message_id", Integer.valueOf(messageId).intValue());
                             pushProps.put("message_type", "push");
                             api.track("$campaign_received", pushProps);
                         } catch (JSONException e) {}

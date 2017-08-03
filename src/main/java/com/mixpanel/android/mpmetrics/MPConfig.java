@@ -61,7 +61,7 @@ import javax.net.ssl.SSLSocketFactory;
  *     <dd>A boolean value. If true, do not send an "$app_open" event when the MixpanelAPI object is created for the first time. Defaults to true - the $app_open event will not be sent by default.</dd>
  *
  *     <dt>com.mixpanel.android.MPConfig.AutoShowMixpanelUpdates</dt>
- *     <dd>A boolean value. If true, automatically show surveys, notifications, and A/B test variants. Defaults to true.</dd>
+ *     <dd>A boolean value. If true, automatically show notifications and A/B test variants. Defaults to true.</dd>
  *
  *     <dt>com.mixpanel.android.MPConfig.EventsEndpoint</dt>
  *     <dd>A string URL. If present, the library will attempt to send events to this endpoint rather than to the default Mixpanel endpoint.</dd>
@@ -76,7 +76,7 @@ import javax.net.ssl.SSLSocketFactory;
  *     <dd>A string URL. If present, AND if DisableFallback is false, people updates will be sent to this endpoint if the EventsEndpoint cannot be reached.</dd>
  *
  *     <dt>com.mixpanel.android.MPConfig.DecideEndpoint</dt>
- *     <dd>A string URL. If present, the library will attempt to get survey, notification, codeless event tracking, and A/B test variant information from this url rather than the default Mixpanel endpoint.</dd>
+ *     <dd>A string URL. If present, the library will attempt to get notification, codeless event tracking, and A/B test variant information from this url rather than the default Mixpanel endpoint.</dd>
  *
  *     <dt>com.mixpanel.android.MPConfig.DecideFallbackEndpoint</dt>
  *     <dd>A string URL. If present, AND if DisableFallback is false, the library will query this url if the DecideEndpoint url cannot be reached.</dd>
@@ -96,7 +96,7 @@ public class MPConfig {
     public static boolean DEBUG = false;
 
     /**
-     * Minimum API level for support of rich UI features, like Surveys, In-App notifications, and dynamic event binding.
+     * Minimum API level for support of rich UI features, like In-App notifications and dynamic event binding.
      * Devices running OS versions below this level will still support tracking and push notification features.
      */
     public static final int UI_FEATURES_MIN_API = 16;
@@ -188,11 +188,10 @@ public class MPConfig {
         mSSLSocketFactory = foundSSLFactory;
 
         DEBUG = metaData.getBoolean("com.mixpanel.android.MPConfig.EnableDebugLogging", false);
-
-        if (metaData.containsKey("com.mixpanel.android.MPConfig.AutoCheckForSurveys")) {
-            MPLog.w(LOGTAG, "com.mixpanel.android.MPConfig.AutoCheckForSurveys has been deprecated in favor of " +
-                          "com.mixpanel.android.MPConfig.AutoShowMixpanelUpdates. Please update this key as soon as possible.");
+        if (DEBUG) {
+            MPLog.setLevel(MPLog.VERBOSE);
         }
+
         if (metaData.containsKey("com.mixpanel.android.MPConfig.DebugFlushInterval")) {
             MPLog.w(LOGTAG, "We do not support com.mixpanel.android.MPConfig.DebugFlushInterval anymore. There will only be one flush interval. Please, update your AndroidManifest.xml.");
         }
@@ -210,11 +209,10 @@ public class MPConfig {
         mDisableDecideChecker = metaData.getBoolean("com.mixpanel.android.MPConfig.DisableDecideChecker", false);
         mImageCacheMaxMemoryFactor = metaData.getInt("com.mixpanel.android.MPConfig.ImageCacheMaxMemoryFactor", 10);
         mIgnoreInvisibleViewsEditor = metaData.getBoolean("com.mixpanel.android.MPConfig.IgnoreInvisibleViewsVisualEditor", false);
-
-        // Disable if EITHER of these is present and false, otherwise enable
-        final boolean surveysAutoCheck = metaData.getBoolean("com.mixpanel.android.MPConfig.AutoCheckForSurveys", true);
-        final boolean mixpanelUpdatesAutoShow = metaData.getBoolean("com.mixpanel.android.MPConfig.AutoShowMixpanelUpdates", true);
-        mAutoShowMixpanelUpdates = surveysAutoCheck && mixpanelUpdatesAutoShow;
+        mAutoShowMixpanelUpdates = metaData.getBoolean("com.mixpanel.android.MPConfig.AutoShowMixpanelUpdates", true);
+        mNotificationDefaults = metaData.getInt("com.mixpanel.android.MPConfig.NotificationDefaults", 0);
+        mMinSessionDuration = metaData.getInt("com.mixpanel.android.MPConfig.MinimumSessionDuration", 10 * 1000); // 10 seconds
+        mSessionTimeoutDuration = metaData.getInt("com.mixpanel.android.MPConfig.SessionTimeoutDuration", Integer.MAX_VALUE); // no timeout by default
 
         mTestMode = metaData.getBoolean("com.mixpanel.android.MPConfig.TestMode", false);
 
@@ -277,8 +275,8 @@ public class MPConfig {
                 "    DisableFallback " + getDisableFallback() + "\n" +
                 "    DisableAppOpenEvent " + getDisableAppOpenEvent() + "\n" +
                 "    DisableViewCrawler " + getDisableViewCrawler() + "\n" +
-                "    DisableDeviceUIBinding " + getDisableGestureBindingUI() + "\n" +
-                "    DisableEmulatorUIBinding " + getDisableEmulatorBindingUI() + "\n" +
+                "    DisableGestureBindingUI " + getDisableGestureBindingUI() + "\n" +
+                "    DisableEmulatorBindingUI " + getDisableEmulatorBindingUI() + "\n" +
                 "    EnableDebugLogging " + DEBUG + "\n" +
                 "    TestMode " + getTestMode() + "\n" +
                 "    EventsEndpoint " + getEventsEndpoint() + "\n" +
@@ -289,7 +287,10 @@ public class MPConfig {
                 "    DecideFallbackEndpoint " + getDecideFallbackEndpoint() + "\n" +
                 "    EditorUrl " + getEditorUrl() + "\n" +
                 "    DisableDecideChecker " + getDisableDecideChecker() + "\n" +
-                "    IgnoreInvisibleViewsEditor " + getIgnoreInvisibleViewsEditor() + "\n"
+                "    IgnoreInvisibleViewsEditor " + getIgnoreInvisibleViewsEditor() + "\n" +
+                "    NotificationDefaults " + getNotificationDefaults() + "\n" +
+                "    MinimumSessionDuration: " + getMinimumSessionDuration() + "\n" +
+                "    SessionTimeoutDuration: " + getSessionTimeoutDuration()
             );
     }
 
@@ -366,7 +367,7 @@ public class MPConfig {
         return mDecideFallbackEndpoint;
     }
 
-    // Check for and show eligible surveys and in app notifications on Activity changes
+    // Check for and show eligible in app notifications on Activity changes
     public boolean getAutoShowMixpanelUpdates() {
         return mAutoShowMixpanelUpdates;
     }
@@ -382,6 +383,18 @@ public class MPConfig {
 
     public boolean getIgnoreInvisibleViewsEditor() {
         return mIgnoreInvisibleViewsEditor;
+    }
+
+    public int getNotificationDefaults() {
+        return mNotificationDefaults;
+    }
+
+    public int getMinimumSessionDuration() {
+        return mMinSessionDuration;
+    }
+
+    public int getSessionTimeoutDuration() {
+        return mSessionTimeoutDuration;
     }
 
     // Pre-configured package name for resources, if they differ from the application package name
@@ -455,6 +468,9 @@ public class MPConfig {
     private final boolean mDisableDecideChecker;
     private final int mImageCacheMaxMemoryFactor;
     private final boolean mIgnoreInvisibleViewsEditor;
+    private final int mNotificationDefaults;
+    private final int mMinSessionDuration;
+    private final int mSessionTimeoutDuration;
 
     // Mutable, with synchronized accessor and mutator
     private SSLSocketFactory mSSLSocketFactory;

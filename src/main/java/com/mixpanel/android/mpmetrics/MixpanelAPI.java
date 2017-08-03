@@ -12,12 +12,11 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
-import android.graphics.Bitmap;
 import android.os.Build;
 import android.os.Bundle;
 
 import com.mixpanel.android.R;
-import com.mixpanel.android.surveys.SurveyActivity;
+import com.mixpanel.android.takeoverinapp.TakeoverInAppActivity;
 import com.mixpanel.android.util.ActivityImageUtils;
 import com.mixpanel.android.util.MPLog;
 import com.mixpanel.android.viewcrawler.TrackingDebug;
@@ -36,12 +35,12 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -238,7 +237,14 @@ public class MixpanelAPI {
             decideId = mPersistentIdentity.getEventsDistinctId();
         }
         mDecideMessages.setDistinctId(decideId);
+
         mMessages = getAnalyticsMessages();
+
+        if (mPersistentIdentity.isFirstLaunch(MPDbAdapter.getInstance(mContext).getDatabaseFile().exists())) {
+            track(AutomaticEvents.FIRST_OPEN, null, true);
+
+            mPersistentIdentity.setHasLaunched();
+        }
 
         if (!mConfig.getDisableDecideChecker()) {
             mMessages.installDecideCheck(mDecideMessages);
@@ -250,7 +256,7 @@ public class MixpanelAPI {
             track("$app_open", null);
         }
 
-        if (!mPersistentIdentity.hasTrackedIntegration()) {
+        if (!mPersistentIdentity.isFirstIntegration(mToken)) {
             try {
                 final JSONObject messageProps = new JSONObject();
 
@@ -259,15 +265,27 @@ public class MixpanelAPI {
                 messageProps.put("distinct_id", token);
 
                 final AnalyticsMessages.EventDescription eventDescription =
-                        new AnalyticsMessages.EventDescription("Integration", messageProps, "85053bf24bba75239b16a601d9387e17");
+                        new AnalyticsMessages.EventDescription("Integration", messageProps, "85053bf24bba75239b16a601d9387e17", false);
                 mMessages.eventsMessage(eventDescription);
-                flush();
-                mPersistentIdentity.setTrackedIntegration(true);
+                mMessages.postToServer(new AnalyticsMessages.FlushDescription("85053bf24bba75239b16a601d9387e17", false));
+
+                mPersistentIdentity.setIsIntegrated(mToken);
             } catch (JSONException e) {
             }
         }
 
+        if (mPersistentIdentity.isNewVersion(deviceInfo.get("$android_app_version_code"))) {
+            try {
+                final JSONObject messageProps = new JSONObject();
+                messageProps.put(AutomaticEvents.VERSION_UPDATED, deviceInfo.get("$android_app_version"));
+                track(AutomaticEvents.APP_UPDATED, messageProps, true);
+            } catch (JSONException e) {}
+
+        }
+
         mUpdatesFromMixpanel.startUpdates();
+
+        ExceptionHandler.init();
     }
 
     /**
@@ -441,6 +459,20 @@ public class MixpanelAPI {
     }
 
     /**
+     * Retrieves the time elapsed for the named event since timeEvent() was called.
+     *
+     * @param eventName the name of the event to be tracked that was previously called with timeEvent()
+     */
+    public double eventElapsedTime(final String eventName) {
+        final long currentTime = System.currentTimeMillis();
+        Long startTime;
+        synchronized (mEventTimings) {
+            startTime = mEventTimings.get(eventName);
+        }
+        return startTime == null ? 0 : (double)((currentTime - startTime) / 1000);
+    }
+
+    /**
      * Track an event.
      *
      * <p>Every call to track eventually results in a data point sent to Mixpanel. These data points
@@ -483,56 +515,7 @@ public class MixpanelAPI {
     // This MAY CHANGE IN FUTURE RELEASES, so minimize code that assumes thread safety
     // (and perhaps document that code here).
     public void track(String eventName, JSONObject properties) {
-        final Long eventBegin;
-        synchronized (mEventTimings) {
-            eventBegin = mEventTimings.get(eventName);
-            mEventTimings.remove(eventName);
-            mPersistentIdentity.removeTimeEvent(eventName);
-        }
-
-        try {
-            final JSONObject messageProps = new JSONObject();
-
-            final Map<String, String> referrerProperties = mPersistentIdentity.getReferrerProperties();
-            for (final Map.Entry<String, String> entry : referrerProperties.entrySet()) {
-                final String key = entry.getKey();
-                final String value = entry.getValue();
-                messageProps.put(key, value);
-            }
-
-            mPersistentIdentity.addSuperPropertiesToObject(messageProps);
-
-            // Don't allow super properties or referral properties to override these fields,
-            // but DO allow the caller to override them in their given properties.
-            final double timeSecondsDouble = (System.currentTimeMillis()) / 1000.0;
-            final long timeSeconds = (long) timeSecondsDouble;
-            messageProps.put("time", timeSeconds);
-            messageProps.put("distinct_id", getDistinctId());
-
-            if (null != eventBegin) {
-                final double eventBeginDouble = ((double) eventBegin) / 1000.0;
-                final double secondsElapsed = timeSecondsDouble - eventBeginDouble;
-                messageProps.put("$duration", secondsElapsed);
-            }
-
-            if (null != properties) {
-                final Iterator<?> propIter = properties.keys();
-                while (propIter.hasNext()) {
-                    final String key = (String) propIter.next();
-                    messageProps.put(key, properties.get(key));
-                }
-            }
-
-            final AnalyticsMessages.EventDescription eventDescription =
-                    new AnalyticsMessages.EventDescription(eventName, messageProps, mToken);
-            mMessages.eventsMessage(eventDescription);
-
-            if (null != mTrackingDebug) {
-                mTrackingDebug.reportTrack(eventName);
-            }
-        } catch (final JSONException e) {
-            MPLog.e(LOGTAG, "Exception tracking event " + eventName, e);
-        }
+        track(eventName, properties, false);
     }
 
     /**
@@ -556,7 +539,7 @@ public class MixpanelAPI {
      * your main application activity.
      */
     public void flush() {
-        mMessages.postToServer();
+        mMessages.postToServer(new AnalyticsMessages.FlushDescription(mToken));
     }
 
     /**
@@ -734,7 +717,7 @@ public class MixpanelAPI {
      * Will not clear referrer information.
      */
     public void reset() {
-        // Will clear distinct_ids, superProperties, notifications, surveys, experiments,
+        // Will clear distinct_ids, superProperties, notifications, experiments,
         // and waiting People Analytics properties. Will have no effect
         // on messages already queued to send with AnalyticsMessages.
         mPersistentIdentity.clearPreferences();
@@ -1091,48 +1074,21 @@ public class MixpanelAPI {
         public String getDistinctId();
 
         /**
-         * If a survey is currently available, this method will launch an activity that shows a
-         * survey to the user and then send the responses to Mixpanel.
-         *
-         * <p>The survey activity will use the root of the given view to take a screenshot
-         * for its background.
-         *
-         * <p>It is safe to call this method any time you want to potentially display an in-app notification.
-         * This method will be a no-op if there is already a survey or in-app notification being displayed.
-         * Thus, if you have both surveys and in-app notification campaigns built in Mixpanel, you may call
-         * both this and {@link People#showNotificationIfAvailable(Activity)} right after each other, and
-         * only one of them will be displayed.
-         *
-         * <p>This method is a no-op in environments with
-         * Android API before JellyBean/API level 16.
-         *
-         * @param parent the Activity that this Survey will be displayed on top of. A snapshot will be
-         * taken of parent to be used as a blurred background.
-         *
-         * @deprecated Surveys are deprecated in 4.9.3 and will be removed from the SDK soon.
-         */
-        @Deprecated
-        public void showSurveyIfAvailable(Activity parent);
-
-        /**
          * Shows an in-app notification to the user if one is available. If the notification
          * is a mini notification, this method will attach and remove a Fragment to parent.
          * The lifecycle of the Fragment will be handled entirely by the Mixpanel library.
          *
-         * <p>If the notification is a takeover notification, a SurveyActivity will be launched to
+         * <p>If the notification is a takeover notification, a TakeoverInAppActivity will be launched to
          * display the Takeover notification.
          *
          * <p>It is safe to call this method any time you want to potentially display an in-app notification.
-         * This method will be a no-op if there is already a survey or in-app notification being displayed.
-         * Thus, if you have both surveys and in-app notification campaigns built in Mixpanel, you may call
-         * both this and {@link People#showSurveyIfAvailable(Activity)} right after each other, and
-         * only one of them will be displayed.
+         * This method will be a no-op if there is already an in-app notification being displayed.
          *
          * <p>This method is a no-op in environments with
          * Android API before JellyBean/API level 16.
          *
          * @param parent the Activity that the mini notification will be displayed in, or the Activity
-         * that will be used to launch SurveyActivity for the takeover notification.
+         * that will be used to launch TakeoverInAppActivity for the takeover notification.
          */
         public void showNotificationIfAvailable(Activity parent);
 
@@ -1161,7 +1117,7 @@ public class MixpanelAPI {
          * @param notif the {@link com.mixpanel.android.mpmetrics.InAppNotification} to show
          *
          * @param parent the Activity that the mini notification will be displayed in, or the Activity
-         * that will be used to launch SurveyActivity for the takeover notification.
+         * that will be used to launch TakeoverInAppActivity for the takeover notification.
          */
         public void showGivenNotification(InAppNotification notif, Activity parent);
 
@@ -1177,24 +1133,8 @@ public class MixpanelAPI {
         public void trackNotification(String eventName, InAppNotification notif);
 
         /**
-         * Returns a Survey object if one is available and being held by the library, or null if
-         * no survey is currently available. Callers who want to display surveys with their own UI
-         * should call this method to get the Survey data. A given survey will be returned only once
-         * from this method, so callers should be ready to consume any non-null return value.
-         *
-         * <p>This function will always return quickly, and will not cause any communication with
-         * Mixpanel's servers, so it is safe to call this from the UI thread.
-         *
-         * @return a Survey object if one is available, null otherwise.
-         *
-         * @deprecated Surveys are deprecated in 4.9.3 and will be removed from the SDK soon.
-         */
-        @Deprecated
-        public Survey getSurveyIfAvailable();
-
-        /**
          * Returns an InAppNotification object if one is available and being held by the library, or null if
-         * no survey is currently available. Callers who want to display in-app notifications should call this
+         * no notification is currently available. Callers who want to display in-app notifications should call this
          * method periodically. A given InAppNotification will be returned only once from this method, so callers
          * should be ready to consume any non-null return value.
          *
@@ -1222,46 +1162,32 @@ public class MixpanelAPI {
         void trackNotificationSeen(InAppNotification notif);
 
         /**
-         * Shows a survey identified by id. The behavior of this is otherwise identical to
-         * {@link People#showSurveyIfAvailable(Activity)}.
-         *
-         * @param id the id of the Survey you wish to show.
-         * @param parent the Activity that this Survey will be displayed on top of. A snapshot will be
-         * taken of parent to be used as a blurred background.
-         *
-         * @deprecated Surveys are deprecated in 4.9.3 and will be removed from the SDK soon.
-         */
-        @Deprecated
-        public void showSurveyById(int id, final Activity parent);
-
-        /**
          * Shows an in-app notification identified by id. The behavior of this is otherwise identical to
          * {@link People#showNotificationIfAvailable(Activity)}.
          *
          * @param id the id of the InAppNotification you wish to show.
          * @param parent  the Activity that the mini notification will be displayed in, or the Activity
-         * that will be used to launch SurveyActivity for the takeover notification.
+         * that will be used to launch TakeoverInAppActivity for the takeover notification.
          */
         public void showNotificationById(int id, final Activity parent);
 
         /**
          * Return an instance of Mixpanel people with a temporary distinct id.
-         * This is used by Mixpanel Surveys but is likely not needed in your code.
          * Instances returned by withIdentity will not check decide with the given distinctId.
          */
         public People withIdentity(String distinctId);
 
         /**
          * Adds a new listener that will receive a callback when new updates from Mixpanel
-         * (like surveys, in-app notifications, or A/B test experiments) are discovered. Most users of the library
-         * will not need this method, since surveys, in-app notifications, and experiments are
+         * (like in-app notifications or A/B test experiments) are discovered. Most users of the library
+         * will not need this method since in-app notifications and experiments are
          * applied automatically to your application by default.
          *
          * <p>The given listener will be called when a new batch of updates is detected. Handlers
          * should be prepared to handle the callback on an arbitrary thread.
          *
-         * <p>The listener will be called when new surveys, in-app notifications, or experiments
-         * are detected as available. That means you wait to call {@link People#showSurveyIfAvailable(Activity)},
+         * <p>The listener will be called when new in-app notifications or experiments
+         * are detected as available. That means you wait to call
          * {@link People#showNotificationIfAvailable(Activity)}, and {@link People#joinExperimentIfAvailable()}
          * to show content and updates that have been delivered to your app. (You can also call these
          * functions whenever else you would like, they're inexpensive and will do nothing if no
@@ -1299,23 +1225,6 @@ public class MixpanelAPI {
          */
         public void removeOnMixpanelTweaksUpdatedListener(OnMixpanelTweaksUpdatedListener listener);
 
-        /**
-         * @deprecated in 4.1.0, Use showSurveyIfAvailable() instead.
-         */
-        @Deprecated
-        public void showSurvey(Survey s, Activity parent);
-
-        /**
-         * @deprecated in 4.1.0, Use getSurveyIfAvailable() instead.
-         */
-        @Deprecated
-        public void checkForSurvey(SurveyCallbacks callbacks);
-
-        /**
-         * @deprecated in 4.1.0, Use getSurveyIfAvailable() instead.
-         */
-        @Deprecated
-        public void checkForSurvey(SurveyCallbacks callbacks, Activity parent);
     }
 
     /**
@@ -1343,7 +1252,7 @@ public class MixpanelAPI {
 
     /**
      * Attempt to register MixpanelActivityLifecycleCallbacks to the application's event lifecycle.
-     * Once registered, we can automatically check for and show surveys and in-app notifications
+     * Once registered, we can automatically check for and show in-app notifications
      * when any Activity is opened.
      *
      * This is only available if the android version is >= 16. You can disable livecycle callbacks by setting
@@ -1360,7 +1269,7 @@ public class MixpanelAPI {
                 mMixpanelActivityLifecycleCallbacks = new MixpanelActivityLifecycleCallbacks(this, mConfig);
                 app.registerActivityLifecycleCallbacks(mMixpanelActivityLifecycleCallbacks);
             } else {
-                MPLog.i(LOGTAG, "Context is not an Application, Mixpanel will not automatically show surveys, in-app notifications, or A/B test experiments. We won't be able to automatically flush on an app background.");
+                MPLog.i(LOGTAG, "Context is not an Application, Mixpanel will not automatically show in-app notifications or A/B test experiments. We won't be able to automatically flush on an app background.");
             }
         }
     }
@@ -1426,16 +1335,19 @@ public class MixpanelAPI {
         final String timeEventsPrefsName = "com.mixpanel.android.mpmetrics.MixpanelAPI.TimeEvents_" + token;
         final Future<SharedPreferences> timeEventsPrefs = sPrefsLoader.loadPreferences(context, timeEventsPrefsName, null);
 
-        return new PersistentIdentity(referrerPreferences, storedPreferences, timeEventsPrefs);
+        final String mixpanelPrefsName = "com.mixpanel.android.mpmetrics.Mixpanel";
+        final Future<SharedPreferences> mixpanelPrefs = sPrefsLoader.loadPreferences(context, mixpanelPrefsName, null);
+
+        return new PersistentIdentity(referrerPreferences, storedPreferences, timeEventsPrefs, mixpanelPrefs);
     }
 
     /* package */ DecideMessages constructDecideUpdates(final String token, final DecideMessages.OnNewResultsListener listener, UpdatesFromMixpanel updatesFromMixpanel) {
-        return new DecideMessages(token, listener, updatesFromMixpanel);
+        return new DecideMessages(mContext, token, listener, updatesFromMixpanel, mPersistentIdentity.getSeenCampaignIds());
     }
 
     /* package */ UpdatesListener constructUpdatesListener() {
         if (Build.VERSION.SDK_INT < MPConfig.UI_FEATURES_MIN_API) {
-            MPLog.i(LOGTAG, "Surveys and Notifications are not supported on this Android OS Version");
+            MPLog.i(LOGTAG, "Notifications are not supported on this Android OS Version");
             return new UnsupportedUpdatesListener();
         } else {
             return new SupportedUpdatesListener();
@@ -1629,27 +1541,6 @@ public class MixpanelAPI {
         }
 
         @Override
-        @Deprecated
-        public void checkForSurvey(final SurveyCallbacks callbacks) {
-            MPLog.i(
-                    LOGTAG,
-                    "MixpanelAPI.checkForSurvey is deprecated. Calling is now a no-op.\n" +
-                     "    to query surveys, call MixpanelAPI.getPeople().getSurveyIfAvailable()"
-            );
-        }
-
-        @Override
-        @Deprecated
-        public void checkForSurvey(final SurveyCallbacks callbacks,
-                final Activity parentActivity) {
-            MPLog.i(
-                    LOGTAG,
-                    "MixpanelAPI.checkForSurvey is deprecated. Calling is now a no-op.\n" +
-                            "    to query surveys, call MixpanelAPI.getPeople().getSurveyIfAvailable()"
-            );
-        }
-
-        @Override
         public InAppNotification getNotificationIfAvailable() {
             return mDecideMessages.getNotification(mConfig.getTestMode());
         }
@@ -1658,6 +1549,7 @@ public class MixpanelAPI {
         public void trackNotificationSeen(InAppNotification notif) {
             if(notif == null) return;
 
+            mPersistentIdentity.saveCampaignAsSeen(notif.getId());
             trackNotification("$campaign_delivery", notif);
             final MixpanelAPI.People people = getPeople().withIdentity(getDistinctId());
             final DateFormat dateFormat = new SimpleDateFormat(ENGAGE_DATE_FORMAT_STRING, Locale.US);
@@ -1669,37 +1561,6 @@ public class MixpanelAPI {
             }
             people.append("$campaigns", notif.getId());
             people.append("$notifications", notifProperties);
-        }
-
-        @Override
-        @Deprecated
-        public Survey getSurveyIfAvailable() {
-            return mDecideMessages.getSurvey(mConfig.getTestMode());
-        }
-
-        @Override
-        @Deprecated
-        public void showSurvey(final Survey survey, final Activity parent) {
-            showGivenOrAvailableSurvey(survey, parent);
-        }
-
-        @Override
-        @Deprecated
-        public void showSurveyIfAvailable(final Activity parent) {
-            if (Build.VERSION.SDK_INT < MPConfig.UI_FEATURES_MIN_API) {
-                return;
-            }
-
-            showGivenOrAvailableSurvey(null, parent);
-        }
-
-        @Override
-        @Deprecated
-        public void showSurveyById(int id, final Activity parent) {
-            final Survey s = mDecideMessages.getSurvey(id, mConfig.getTestMode());
-            if (s != null) {
-                showGivenOrAvailableSurvey(s, parent);
-            }
         }
 
         @Override
@@ -1922,63 +1783,6 @@ public class MixpanelAPI {
             }
         }
 
-        @Deprecated
-        private void showGivenOrAvailableSurvey(final Survey surveyOrNull, final Activity parent) {
-            // Showing surveys is not supported before Jelly Bean
-            if (Build.VERSION.SDK_INT < MPConfig.UI_FEATURES_MIN_API) {
-                MPLog.v(LOGTAG, "Will not show survey, os version is too low.");
-                return;
-            }
-
-            if (!ConfigurationChecker.checkSurveyActivityAvailable(parent.getApplicationContext())) {
-                MPLog.v(LOGTAG, "Will not show survey, application isn't configured appropriately.");
-                return;
-            }
-
-            BackgroundCapture.OnBackgroundCapturedListener listener = null;
-            final ReentrantLock lock = UpdateDisplayState.getLockObject();
-            lock.lock();
-            try {
-                if (UpdateDisplayState.hasCurrentProposal()) {
-                    return; // Already being used.
-                }
-                Survey toShow = surveyOrNull;
-                if (null == toShow) {
-                    toShow = getSurveyIfAvailable();
-                }
-                if (null == toShow) {
-                    return; // Nothing to show
-                }
-
-                final UpdateDisplayState.DisplayState.SurveyState surveyDisplay =
-                        new UpdateDisplayState.DisplayState.SurveyState(toShow);
-
-                final int intentId = UpdateDisplayState.proposeDisplay(surveyDisplay, getDistinctId(), mToken);
-                if (intentId <= 0) {
-                    MPLog.e(LOGTAG, "DisplayState Lock is in an inconsistent state! Please report this issue to Mixpanel");
-                    return;
-                }
-
-                listener = new BackgroundCapture.OnBackgroundCapturedListener() {
-                    @Override
-                    public void onBackgroundCaptured(Bitmap bitmapCaptured, int highlightColorCaptured) {
-                        surveyDisplay.setBackground(bitmapCaptured);
-                        surveyDisplay.setHighlightColor(highlightColorCaptured);
-
-                        final Intent surveyIntent = new Intent(parent.getApplicationContext(), SurveyActivity.class);
-                        surveyIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                        surveyIntent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
-                        surveyIntent.putExtra(SurveyActivity.INTENT_ID_KEY, intentId);
-                        parent.startActivity(surveyIntent);
-                    }
-                };
-            } finally {
-                lock.unlock();
-            }
-
-            BackgroundCapture.captureBackground(parent, listener);
-        }
-
         private void showGivenOrAvailableNotification(final InAppNotification notifOrNull, final Activity parent) {
             if (Build.VERSION.SDK_INT < MPConfig.UI_FEATURES_MIN_API) {
                 MPLog.v(LOGTAG, "Will not show notifications, os version is too low.");
@@ -2007,7 +1811,7 @@ public class MixpanelAPI {
                         }
 
                         final InAppNotification.Type inAppType = toShow.getType();
-                        if (inAppType == InAppNotification.Type.TAKEOVER && ! ConfigurationChecker.checkSurveyActivityAvailable(parent.getApplicationContext())) {
+                        if (inAppType == InAppNotification.Type.TAKEOVER && !ConfigurationChecker.checkTakeoverInAppActivityAvailable(parent.getApplicationContext())) {
                             MPLog.v(LOGTAG, "Application is not configured to show takeover notifications, none will be shown.");
                             return; // Can't show due to config.
                         }
@@ -2054,10 +1858,10 @@ public class MixpanelAPI {
                             case TAKEOVER: {
                                 MPLog.v(LOGTAG, "Sending intent for takeover notification.");
 
-                                final Intent intent = new Intent(parent.getApplicationContext(), SurveyActivity.class);
+                                final Intent intent = new Intent(parent.getApplicationContext(), TakeoverInAppActivity.class);
                                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                                 intent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
-                                intent.putExtra(SurveyActivity.INTENT_ID_KEY, intentId);
+                                intent.putExtra(TakeoverInAppActivity.INTENT_ID_KEY, intentId);
                                 parent.startActivity(intent);
                             }
                             break;
@@ -2106,34 +1910,28 @@ public class MixpanelAPI {
 
         @Override
         public void addOnMixpanelUpdatesReceivedListener(OnMixpanelUpdatesReceivedListener listener) {
-            synchronized (mListeners) {
-                mListeners.add(listener);
+            mListeners.add(listener);
 
-                if (mDecideMessages.hasUpdatesAvailable()) {
-                    onNewResults();
-                }
+            if (mDecideMessages.hasUpdatesAvailable()) {
+                onNewResults();
             }
         }
 
         @Override
         public void removeOnMixpanelUpdatesReceivedListener(OnMixpanelUpdatesReceivedListener listener) {
-            synchronized (mListeners) {
-                mListeners.remove(listener);
-            }
+            mListeners.remove(listener);
         }
 
         @Override
         public void run() {
             // It's possible that by the time this has run the updates we detected are no longer
             // present, which is ok.
-            synchronized (mListeners) {
-                for (final OnMixpanelUpdatesReceivedListener listener : mListeners) {
-                    listener.onMixpanelUpdatesReceived();
-                }
+            for (final OnMixpanelUpdatesReceivedListener listener : mListeners) {
+                listener.onMixpanelUpdatesReceived();
             }
         }
 
-        private final Set<OnMixpanelUpdatesReceivedListener> mListeners = new HashSet<OnMixpanelUpdatesReceivedListener>();
+        private final Set<OnMixpanelUpdatesReceivedListener> mListeners = Collections.newSetFromMap(new ConcurrentHashMap<OnMixpanelUpdatesReceivedListener, Boolean>());
         private final Executor mExecutor = Executors.newSingleThreadExecutor();
     }
 
@@ -2176,10 +1974,70 @@ public class MixpanelAPI {
     }
 
     ////////////////////////////////////////////////////
+    protected void flushNoDecideCheck() {
+        mMessages.postToServer(new AnalyticsMessages.FlushDescription(mToken, false));
+    }
+
+    protected void track(String eventName, JSONObject properties, boolean isAutomaticEvent) {
+        if (isAutomaticEvent && !mDecideMessages.shouldTrackAutomaticEvent()) {
+            return;
+        }
+
+        final Long eventBegin;
+        synchronized (mEventTimings) {
+            eventBegin = mEventTimings.get(eventName);
+            mEventTimings.remove(eventName);
+            mPersistentIdentity.removeTimeEvent(eventName);
+        }
+
+        try {
+            final JSONObject messageProps = new JSONObject();
+
+            final Map<String, String> referrerProperties = mPersistentIdentity.getReferrerProperties();
+            for (final Map.Entry<String, String> entry : referrerProperties.entrySet()) {
+                final String key = entry.getKey();
+                final String value = entry.getValue();
+                messageProps.put(key, value);
+            }
+
+            mPersistentIdentity.addSuperPropertiesToObject(messageProps);
+
+            // Don't allow super properties or referral properties to override these fields,
+            // but DO allow the caller to override them in their given properties.
+            final double timeSecondsDouble = (System.currentTimeMillis()) / 1000.0;
+            final long timeSeconds = (long) timeSecondsDouble;
+            messageProps.put("time", timeSeconds);
+            messageProps.put("distinct_id", getDistinctId());
+
+            if (null != eventBegin) {
+                final double eventBeginDouble = ((double) eventBegin) / 1000.0;
+                final double secondsElapsed = timeSecondsDouble - eventBeginDouble;
+                messageProps.put("$duration", secondsElapsed);
+            }
+
+            if (null != properties) {
+                final Iterator<?> propIter = properties.keys();
+                while (propIter.hasNext()) {
+                    final String key = (String) propIter.next();
+                    messageProps.put(key, properties.get(key));
+                }
+            }
+
+            final AnalyticsMessages.EventDescription eventDescription =
+                    new AnalyticsMessages.EventDescription(eventName, messageProps, mToken, isAutomaticEvent);
+            mMessages.eventsMessage(eventDescription);
+
+            if (null != mTrackingDebug) {
+                mTrackingDebug.reportTrack(eventName);
+            }
+        } catch (final JSONException e) {
+            MPLog.e(LOGTAG, "Exception tracking event " + eventName, e);
+        }
+    }
 
     private void recordPeopleMessage(JSONObject message) {
         if (message.has("$distinct_id")) {
-           mMessages.peopleMessage(message);
+           mMessages.peopleMessage(new AnalyticsMessages.PeopleDescription(message, mToken));
         } else {
            mPersistentIdentity.storeWaitingPeopleRecord(message);
         }
@@ -2198,7 +2056,7 @@ public class MixpanelAPI {
         for (int i = 0; i < records.length(); i++) {
             try {
                 final JSONObject message = records.getJSONObject(i);
-                mMessages.peopleMessage(message);
+                mMessages.peopleMessage(new AnalyticsMessages.PeopleDescription(message, mToken));
             } catch (final JSONException e) {
                 MPLog.e(LOGTAG, "Malformed people record stored pending identity, will not send it.", e);
             }
